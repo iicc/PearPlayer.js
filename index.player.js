@@ -18,12 +18,18 @@ function PearPlayer(selector, token, opts) {
     if (!(self instanceof PearPlayer)) return new PearPlayer(selector, token, opts);
     if (typeof token === 'object') return PearPlayer(selector, '', token);
     if (!opts) opts = {};
-    if (typeof selector !== 'string') throw new Error('video selector must be a string!');
-    self.video = document.querySelector(selector);
+    if (typeof selector === 'string') {
+        self.video = document.querySelector(selector);        
+    } else if (Object.prototype.toString.call(selector) === '[object HTMLVideoElement]') {
+        self.video = selector;
+    } else {
+        throw new Error('illegal video selector');
+    }
     opts.selector = selector;
     opts.render = render;
     opts.sequencial = true;                           //player必须有序下载buffer
     opts.interval = 3000;
+    if (!opts.algorithm) opts.algorithm = 'pull';     //algorithm默认‘pull’
 
     //monitor
     self.canPlayDelayStart = (new Date()).getTime();

@@ -19,10 +19,15 @@ var Set = require('./set');
 var PearTorrent = require('./pear-torrent');
 var Scheduler = require('./node-scheduler');
 var Reporter = require('./reporter');
+var RangeLoader = require('./range-loader');
+
+var PieceValidator = require('./piece-validator');
 
 // var WEBSOCKET_ADDR = 'ws://signal.webrtc.win:9600/ws';             //test
 var WEBSOCKET_ADDR = 'wss://signal.webrtc.win:7601/wss';
 var GETNODES_ADDR = 'https://api.webrtc.win:6601/v1/customer/nodes';
+var GETGEONODES_ADDR = 'https://api.webrtc.win/v1/customer/geo_nodes';
+var md5 = require('blueimp-md5')
 var BLOCK_LENGTH = 32 * 1024;
 
 inherits(Worker, EventEmitter);
@@ -45,6 +50,7 @@ function Worker(urlStr, token, opts) {
     self.selector = opts.selector;
     self.autoplay = opts.autoplay === false ? false : true;
 
+    self.auto = opts.auto;
     self.src = urlStr;
     self.urlObj = url.parse(self.src);
     self.scheduler = opts.scheduler || 'IdleFirst';
@@ -60,6 +66,7 @@ function Worker(urlStr, token, opts) {
     self.peerId = getPeerId();
     self.isPlaying = false;
     self.fileLength = 0;
+    self.downloaded = 0;
     self.nodes = [];
     self.websocket = null;
     self.dispatcher = null;
@@ -76,7 +83,8 @@ function Worker(urlStr, token, opts) {
         useMonitor: self.useMonitor,
         scheduler: Scheduler[self.scheduler],
         sequencial: opts.sequencial,
-        maxLoaders: opts.maxLoaders || (opts.sequencial ? 5 : 15)
+        maxLoaders: opts.maxLoaders || 10,
+        algorithm: opts.algorithm  || 'push'            // push or pull
     };
 
     if (self.useDataChannel) {
@@ -99,10 +107,16 @@ function Worker(urlStr, token, opts) {
         windowOffset: 0,
         windowLength: 0,
         signalServerConnected: false,
-        traffics: {}
+        traffics: {},
+        abilities: {}
     };
 
+    //getNodes API
+    self.getNodesUrl = opts.geoEnabled === true ? GETGEONODES_ADDR : GETNODES_ADDR;
+
     self._start();
+
+
 }
 
 Worker.isRTCSupported = function () {
@@ -113,7 +127,6 @@ Worker.isRTCSupported = function () {
 Object.defineProperty(Worker.prototype, 'debugInfo', {
     get: function () { return this._debugInfo }
 });
-
 
 
 Worker.prototype._start = function () {
@@ -134,10 +147,15 @@ Worker.prototype._start = function () {
             debug('nodes:'+JSON.stringify(nodes));
 
             if (length) {
-                // self.fileLength = fileLength;
+
                 debug('nodeFilter fileLength:'+fileLength);
 
-                self._startPlaying(nodes);
+                if (self.auto) {
+                    self._startPlaying(nodes);
+                } else {
+                    self._initRangeLoader(nodes);
+                }
+
             } else {
 
                 self._fallBack();
@@ -148,7 +166,25 @@ Worker.prototype._start = function () {
         self._getNodes(self.token, function (nodes) {
             debug('debug _getNodes: %j', nodes);
             if (nodes) {
-                self._startPlaying(nodes);
+
+                var xhr = new XMLHttpRequest();
+                xhr.responseType = "arraybuffer";
+                xhr.open("GET", self.torrentUrl);
+                xhr.onload = function () {
+                    var response = this.response;
+                    // console.warn(response);
+                    self.validator = new PieceValidator(response);
+
+                    if (self.auto) {
+                        self._startPlaying(nodes);
+                    } else {
+                        self._initRangeLoader(nodes);
+                    }
+                }
+                xhr.send();
+
+
+
                 // if (self.useDataChannel) {
                 //     self._pearSignalHandshake();
                 // }
@@ -193,7 +229,7 @@ Worker.prototype._getNodes = function (token, cb) {
     var self = this;
 
     var postData = {
-        client_ip:'116.77.208.118',
+        // client_ip:'116.77.208.118',
         host: self.urlObj.host,
         uri: self.urlObj.path
     };
@@ -207,7 +243,7 @@ Worker.prototype._getNodes = function (token, cb) {
     })(postData);
 
     var xhr = new XMLHttpRequest();
-    xhr.open("GET", GETNODES_ADDR+postData);
+    xhr.open("GET", self.getNodesUrl+postData);
     xhr.timeout = 2000;
     xhr.setRequestHeader('X-Pear-Token', self.token);
     xhr.ontimeout = function() {
@@ -227,9 +263,8 @@ Worker.prototype._getNodes = function (token, cb) {
             if (res.size) {                         //如果filesize大于0
                 self.fileLength = res.size;
 
-                // if (self.useDataChannel) {
-                //     self._pearSignalHandshake();
-                // }
+                self.torrentUrl = res.torrents['512'];
+
 
                 if (!res.nodes){                            //如果没有可用节点则切换到纯webrtc模式
                     // cb(null);
@@ -244,40 +279,66 @@ Worker.prototype._getNodes = function (token, cb) {
                     var httpCount = 0;
                     for (var i=0; i<nodes.length; ++i) {
                         var protocol = nodes[i].protocol;
-                        if (protocol === 'webtorrent') {
+
+                        if (protocol && protocol === 'webtorrent') {                                   //webtorrent
                             if (!self.magnetURI) {                     //如果用户没有指定magnetURI
                                 self.magnetURI = nodes[i].magnet_uri;
                                 debug('_getNodes magnetURI:'+nodes[i].magnet_uri);
                             }
-                        } else {
-                            protocol === 'https' ? httpsCount++ : httpCount++;
-                            if (isLocationHTTP || protocol !== 'http') {
-                                var host = nodes[i].host;
-                                var type = nodes[i].type;
-                                var path = self.urlObj.host + self.urlObj.path;
-                                var url = protocol+'://'+host+'/'+path;
-                                if (!self.nodeSet.has(url)) {
-                                    allNodes.push({uri: url, type: type});
-                                    self.nodeSet.add(url);
-                                }
+                        } else {                                                                        //http/https
+                            httpsCount ++;
+                            httpCount ++;
+                            protocol = isLocationHTTP ? 'http' : 'https';
+                            var port = isLocationHTTP ? nodes[i].http_port : nodes[i].https_port;
+                            var host = nodes[i].host + ':' + port;
+                            var type = nodes[i].type;
+                            var capacity = nodes[i].capacity;
+                            var path = self.urlObj.host + self.urlObj.path;
+                            var url = protocol+'://'+host+'/'+path;
+                            if (!self.nodeSet.has(url)) {
+                                allNodes.push({uri: url, type: type, capacity: capacity});
+                                self.nodeSet.add(url);
                             }
                         }
+
+
+                        // if (protocol === 'webtorrent') {
+                        //     if (!self.magnetURI) {                     //如果用户没有指定magnetURI
+                        //         self.magnetURI = nodes[i].magnet_uri;
+                        //         debug('_getNodes magnetURI:'+nodes[i].magnet_uri);
+                        //     }
+                        // } else {
+                        //     protocol === 'https' ? httpsCount++ : httpCount++;
+                        //     if (isLocationHTTP || protocol !== 'http') {
+                        //         var host = nodes[i].host;
+                        //         var type = nodes[i].type;
+                        //         var capacity = nodes[i].capacity;
+                        //         var path = self.urlObj.host + self.urlObj.path;
+                        //         var url = protocol+'://'+host+'/'+path;
+                        //         if (!self.nodeSet.has(url)) {
+                        //             allNodes.push({uri: url, type: type, capacity: capacity});
+                        //             self.nodeSet.add(url);
+                        //         }
+                        //     }
+                        // }
                     }
 
                     self._debugInfo.totalHTTPS = httpsCount;
                     self._debugInfo.totalHTTP = httpCount;
 
-                    debug('allNodes:'+JSON.stringify(allNodes));
+                    // debug('allNodes:'+JSON.stringify(allNodes));
                     self.nodes = allNodes;
                     if (allNodes.length === 0) cb([{uri: self.src, type: 'server'}]);
                     nodeFilter(allNodes, function (nodes, fileLength) {            //筛选出可用的节点,以及回调文件大小
                         // nodes = [];                                            //test
                         var length = nodes.length;
-                        debug('nodes:'+JSON.stringify(nodes));
+                        // debug('nodes:'+JSON.stringify(nodes));
 
+                        // self._debugInfo.usefulHTTPAndHTTPS = self._debugInfo.totalHTTPS;
                         self._debugInfo.usefulHTTPAndHTTPS = length;
+                        // console.warn('totalHTTPS:' + self._debugInfo.totalHTTPS + ' usefulHTTPAndHTTPS:' + length);
                         if (length) {
-                            self.fileLength = fileLength;
+                            // self.fileLength = fileLength;
                             // debug('nodeFilter fileLength:'+fileLength);
                             // self.nodes = nodes;
                             if (length <= 2) {
@@ -293,9 +354,9 @@ Worker.prototype._getNodes = function (token, cb) {
                             }
                         } else {
                             // self._fallBack();
-                            cb([{uri: self.src, type: 'server'}]);
+                            // cb([{uri: self.src, type: 'server'}]);
                         }
-                    }, {start: 0, end: 10});
+                    }, {start: 0, end: 30}, self.fileLength);
                 }
             } else {
                 cb(null);
@@ -342,7 +403,8 @@ Worker.prototype._pearSignalHandshake = function () {
         var message = JSON.parse(e.data);
         // debug("[simpleRTC] websocket message is: " + JSON.stringify(message));
         // message = message.nodes[1];
-        if (message.action === 'candidate' && message.type === 'end') {
+        //字段错误 message -> message.candidates
+        if (message.action === 'candidate' && message.candidates.type === 'end') {
 
             for (var peerId in self.candidateMap) {
                 if (message.peer_id === peerId) {
@@ -425,6 +487,7 @@ Worker.prototype._startPlaying = function (nodes) {
     for (var i=0;i<nodes.length;++i) {
         var node = nodes[i];
         var hd = new HttpDownloader(node.uri, node.type);
+        hd.id = i;                                                 //test
         self.dispatcherConfig.initialDownloaders.push(hd);
     }
     self.dispatcherConfig.fileSize = self.fileLength;
@@ -438,7 +501,7 @@ Worker.prototype._startPlaying = function (nodes) {
 
     var d = new Dispatcher(self.dispatcherConfig);
     self.dispatcher = d;
-
+    d.validator = self.validator;
     while (self.tempDCQueue.length) {
         var jd = self.tempDCQueue.shift();
         self.dispatcher.addDataChannel(jd);
@@ -461,18 +524,24 @@ Worker.prototype._startPlaying = function (nodes) {
             Reporter.reportTraffic(self.peerId, self.fileLength, traffics);
         }, 5000);
 
-        nodeFilter(self.nodes, function (nodes, fileLength) {            //筛选出可用的节点,以及回调文件大小
+        //开始上报节点能力值
+        self.reportAbilitiesId = setInterval(function () {
 
-            if (nodes.length) {
+            Reporter.reportAbilities(self._debugInfo.abilities);
+        }, 10000);
 
-                self._debugInfo.usefulHTTPAndHTTPS += nodes.length;
-                nodes.map(function (item) {
-
-                    var hd = new HttpDownloader(item.uri, item.type);
-                    d.addNode(hd);
-                });
-            }
-        }, {start: 10, end: 30});
+        // nodeFilter(self.nodes, function (nodes, fileLength) {            //筛选出可用的节点,以及回调文件大小
+        //
+        //     if (nodes.length) {
+        //
+        //         self._debugInfo.usefulHTTPAndHTTPS += nodes.length;
+        //         nodes.map(function (item) {
+        //
+        //             var hd = new HttpDownloader(item.uri, item.type);
+        //             d.addNode(hd);
+        //         });
+        //     }
+        // }, {start: 30, end: 50});
 
         if (self.useTorrent && self.magnetURI) {
             var client = new PearTorrent();
@@ -523,20 +592,20 @@ Worker.prototype._startPlaying = function (nodes) {
 
     d.on('needmorenodes', function () {
         debug('request more nodes');
-        self._getNodes(self.token, function (nodes) {
-            debug('needmorenodes _getNodes:'+JSON.stringify(nodes));
-            if (nodes) {
-                // d.addNodes(nodes);
-                for (var i=0;i<nodes.length;++i) {
-                    var node = nodes[i];
-                    var hd = new HttpDownloader(node.uri, node.type);
-                    d.addNode(hd);
-                }
-            } else {
-                debug('noMoreNodes');
-                d.noMoreNodes = true;
-            }
-        });
+        // self._getNodes(self.token, function (nodes) {
+        //     debug('needmorenodes _getNodes:'+JSON.stringify(nodes));
+        //     if (nodes) {
+        //         // d.addNodes(nodes);
+        //         for (var i=0;i<nodes.length;++i) {
+        //             var node = nodes[i];
+        //             var hd = new HttpDownloader(node.uri, node.type);
+        //             d.addNode(hd);
+        //         }
+        //     } else {
+        //         debug('noMoreNodes');
+        //         d.noMoreNodes = true;
+        //     }
+        // });
 
     });
     d.on('needsource', function () {
@@ -576,16 +645,27 @@ Worker.prototype._startPlaying = function (nodes) {
         Reporter.finalyReportTraffic(self.peerId, self.fileLength, traffics);
         //移除interval
         clearInterval(self.reportTrafficId);
+        clearInterval(self.reportAbilitiesId);
         self.reportTrafficId = null;
 
         self.emit('done');
     });
     d.on('downloaded', function (downloaded) {
 
-        var progress = downloaded > 1.0 ? 1.0 : downloaded;
-        self.emit('progress', progress);
+        // var progress = downloaded > 1.0 ? 1.0 : downloaded;
+        // if (progress > self.progress) {
+        self.downloaded += downloaded;
+        if (self.downloaded >= self.fileLength) {
+            self.emit('progress', 1.0);
+        } else {
+            self.emit('progress', self.downloaded/self.fileLength);
+        }
+
+        //     self.progress = progress;
+        // }
     });
     d.on('meanspeed', function (meanSpeed) {
+
 
         self.emit('meanspeed', meanSpeed);
     });
@@ -609,8 +689,9 @@ Worker.prototype._startPlaying = function (nodes) {
 
         self.emit('sourcemap', sourceType, index);
     });
-    d.on('traffic', function (mac, size, type) {
+    d.on('traffic', function (mac, size, type, meanSpeed) {
 
+        //流量上报
         if (!self._debugInfo.traffics[mac]) {
             self._debugInfo.traffics[mac] = {};
             self._debugInfo.traffics[mac].mac = mac;
@@ -618,6 +699,12 @@ Worker.prototype._startPlaying = function (nodes) {
         } else {
             self._debugInfo.traffics[mac].traffic += size;
         }
+
+        //能力值上报
+        if (meanSpeed) {
+            self._debugInfo.abilities[mac] = meanSpeed;
+        }
+
         self.emit('traffic', mac, size, type);
     });
     d.on('datachannelerror', function () {
@@ -629,6 +716,28 @@ Worker.prototype._startPlaying = function (nodes) {
         self._debugInfo.windowOffset = windowOffset;
         self._debugInfo.windowLength = windowLength;
     });
+    d.on('httperror', function () {
+        self._debugInfo.usefulHTTPAndHTTPS --;
+    })
+};
+
+Worker.prototype._initRangeLoader = function (nodes) {
+    debug('_initRangeLoader');
+    var initialDownloaders = [];
+    for (var i=0;i<nodes.length;++i) {
+        var node = nodes[i];
+        var hd = new HttpDownloader(node.uri, node.type);
+        hd.id = i;                                                 //test
+        initialDownloaders.push(hd);
+    }
+
+    this.loader = new RangeLoader({initialDownloaders:initialDownloaders})
+
+    this.emit('begin');
+};
+
+Worker.prototype.select = function (start, end, cb) {
+    this.loader.select(start, end, cb);
 };
 
 function getBrowserRTC () {

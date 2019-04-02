@@ -5,16 +5,16 @@
 module.exports = NodeFilter;
 
 /*
-    nodesArray: {uri: string type: string}
-    cb: function
-    range: {start: number end: number}
+ nodesArray: {uri: string type: string capacity: number}
+ cb: function
+ range: {start: number end: number}
  */
 
 var debug = require('debug')('pear:node-filter');
 
 function NodeFilter(nodesArray, cb, range) {
 
-    // var ipArray = array.unique();
+    // cb(nodesArray, 0);
     var doneCount = 0;
     var usefulNodes = [];
     var fileLength = 0;
@@ -26,6 +26,9 @@ function NodeFilter(nodesArray, cb, range) {
     } else if (range.end > nodesArray.length) {
         range.end = nodesArray.length;
     }
+
+    //计时
+    var timeStart = performance.now();
 
     for (var i=range.start;i<range.end;++i) {
 
@@ -39,10 +42,12 @@ function NodeFilter(nodesArray, cb, range) {
     function connectTest(node) {
 
         var xhr = new XMLHttpRequest;
-        xhr.timeout = 1000;
+        xhr.timeout = 1500;
         xhr.open('head', node.uri);
         xhr.onload = function () {
             doneCount ++;
+            node.time = performance.now() - timeStart;
+            // console.warn(`node.time ${node.time}`);
             if (this.status >= 200 && this.status<300) {
                 usefulNodes.push(node);
                 fileLength = xhr.getResponseHeader('content-length');
@@ -69,20 +74,26 @@ function NodeFilter(nodesArray, cb, range) {
         // }
 
         if (doneCount === (range.end-range.start)) {
+
+            //根据capacity对节点进行排序
+            // usefulNodes.sort(function (a, b) {          //按能力值从大到小排序
+            //     return b.capacity - a.capacity;
+            // });
+
+            //根据响应时间排序
+            usefulNodes.sort(function (a, b) {          //按响应时间从小到大排序
+                return a.time - b.time;
+            });
+
+            for(var i = 0; i < usefulNodes.length; i++) {
+                debug('node ' + i + ' capacity ' + usefulNodes[i].capacity);
+            }
+            debug('length: ' + usefulNodes.filter(function (node) {
+                    return node.capacity >= 5;
+                }).length);
+
             cb(usefulNodes, fileLength);
         }
     }
 
 };
-
-// Array.prototype.unique = function()
-// {
-//     var n = []; //一个新的临时数组
-//     for(var i = 0; i < this.length; i++) //遍历当前数组
-//     {
-//         //如果当前数组的第i已经保存进了临时数组，那么跳过，
-//         //否则把当前项push到临时数组里面
-//         if (n.indexOf(this[i]) == -1) n.push(this[i]);
-//     }
-//     return n;
-// };
